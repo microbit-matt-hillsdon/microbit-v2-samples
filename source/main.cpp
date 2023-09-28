@@ -7,7 +7,7 @@ int main()
 {
     uBit.init();
 
-    data_logging_timeseries();
+    out_of_box_experience();
 
     microbit_panic( 999 );
 }
