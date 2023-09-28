@@ -104,5 +104,6 @@ void stream_test_mic_activate();
 void stream_test_getValue_interval();
 void stream_test_record();
 void stream_test_all();
+void data_logging_timeseries();
 
 #endif

@@ -19,8 +19,10 @@ void data_logging_timeseries()
             uBit.log.clear(false);
         }
         if (uBit.log.isFull())
+        {
             uBit.display.scroll("F");
-        logging = false;
+            logging = false;
+        }
         if (logging)
         {
             uBit.log.beginRow();
@@ -28,7 +30,7 @@ void data_logging_timeseries()
             uBit.log.logData("y", uBit.accelerometer.getY());
             uBit.log.logData("z", uBit.accelerometer.getZ());
             uBit.log.endRow();
+            uBit.sleep(250);
         }
-        uBit.sleep(250);
     }
 }
