@@ -9,7 +9,7 @@
 #ifdef MICROBIT_UBIT_AS_STATIC_OBJECT
 extern MicroBit uBit;
 #else
-extern MicroBit& uBit;
+extern MicroBit &uBit;
 #endif
 
 void blinky();
@@ -98,7 +98,7 @@ void out_of_box_experience();
 void level_meter();
 void init_clap_detect();
 void ble_test();
-void deepsleep_test( int test);
+void deepsleep_test( int test );
 void neopixel_test();
 void stream_test_mic_activate();
 void stream_test_getValue_interval();
@@ -106,5 +106,6 @@ void stream_test_record();
 void stream_test_all();
 void data_logging_timeseries();
 void data_logging_timeseries_next_gen();
+void data_logging_csv_from_serial();
 
 #endif
