@@ -107,5 +107,6 @@ void stream_test_all();
 void data_logging_timeseries();
 void data_logging_timeseries_next_gen();
 void data_logging_csv_from_serial();
+void data_logging_csv_from_char_arr();
 
 #endif
