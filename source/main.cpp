@@ -7,7 +7,7 @@ int main()
 {
     uBit.init();
 
-    out_of_box_experience();
+    serial_bridge_test();
 
     microbit_panic( 999 );
 }

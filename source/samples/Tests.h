@@ -99,5 +99,7 @@ void stream_test_record();
 void stream_test_recording_sample_rates();
 void stream_test_all();
 void streamer_serial_test();
+void data_log_test();
+void serial_bridge_test();
 
 #endif
