@@ -30,6 +30,9 @@
 // a request is accepted but not required, so requests can be typed by hand in
 // a terminal.
 //
+// 'T' measures how fast the log can be read out of the interface chip's flash,
+// with no host or serial involved. See handle_benchmark.
+//
 // '?' sends 2KB of filler and then answers, to prime DAPLink's serial buffer
 // without the reply being the thing the buffer throws away. See send_padding.
 // '? 0' answers without the filler.
@@ -38,11 +41,21 @@
 // <DAPLink:Overflow> in the stream, and noticing the log was cleared are all
 // the client's job. The device only has to describe what it sent accurately.
 //
+// This is the development program: it carries the measurement and diagnostic
+// commands as well as the protocol. For something shaped like a program a user
+// would really write, see DataLogDemo.cpp.
+//
 // Logging is off until button A is pressed, and button B stops it again. The
 // device starts stopped so a host can connect, look at what is already in the
 // log, and only then start adding to it. A and B together clear the log, and
 // leave logging stopped.
 //
+// Touching the logo toggles a simulated student program that shares the serial
+// port: it competes for incoming bytes and writes output of its own. This is
+// how the contention the production version has to solve can be seen. See
+// student_fiber.
+//
+// The top right pixel is lit while that simulation is running.
 // The top left pixel is lit while logging. The centre pixel lights for each
 // completed request, so a dead link can be told apart from a dead reply: pixel
 // but no text means transmit is broken, no pixel at all means receive is.
@@ -56,12 +69,27 @@
 #define BRIDGE_NOTIFY_INTERVAL  250
 #define BRIDGE_PRIME_BYTES      2048
 
+// Benchmark. The stride is deliberately not a multiple of the log's 256 byte
+// cache block, so scattered reads land in a different block each time.
+#define BRIDGE_BENCH_BUFFER     256
+#define BRIDGE_BENCH_READS      64
+#define BRIDGE_BENCH_STRIDE     1021
+#define BRIDGE_BENCH_MINIMUM    2048
+#define BRIDGE_FILL_MAX         2000
+
+// Simulated student program. Poll interval in ms: lower steals more
+// aggressively. Chatter is in poll intervals, so 100 at 5ms is twice a second.
+#define BRIDGE_STUDENT_POLL     1
+#define BRIDGE_STUDENT_CHATTER  500
+#define BRIDGE_STUDENT_BUFFER   32
+
 // Flags reported in the hello reply.
 #define BRIDGE_FLAG_PRESENT     0x01
 #define BRIDGE_FLAG_FULL        0x02
 #define BRIDGE_FLAG_MIRRORING   0x04
 #define BRIDGE_FLAG_SUBSCRIBED  0x08
 #define BRIDGE_FLAG_LOGGING     0x10
+#define BRIDGE_FLAG_STUDENT     0x20
 
 // Where the "logging is running" indicator sits, kept clear of the centre
 // pixel the request indicator uses.
@@ -71,6 +99,12 @@
 static char     requestBuffer[BRIDGE_MAX_REQUEST];
 static uint8_t  chunkBuffer[BRIDGE_MAX_CHUNK];
 static char     hexBuffer[2 * BRIDGE_MAX_CHUNK + 1];
+static uint8_t  benchBuffer[BRIDGE_BENCH_BUFFER];
+static char     stolenBuffer[BRIDGE_STUDENT_BUFFER];
+static volatile bool requestSeen = false;
+static volatile bool studentActive = false;
+static uint32_t stolenBytes = 0;
+static uint32_t lockouts = 0;
 static bool     mirroring = false;
 static bool     subscribed = false;
 static bool     readInProgress = false;
@@ -149,6 +183,131 @@ log_row_fiber()
         }
 
         uBit.sleep(1000);
+    }
+}
+
+/**
+ * Touching the logo turns the simulated student program on and off.
+ *
+ * Deliberately not a serial command: once the simulation is eating bytes, a
+ * command to stop it is exactly the sort of thing that gets eaten.
+ */
+static void
+onLogo(Event)
+{
+    studentActive = !studentActive;
+    uBit.display.image.setPixelValue(4, 0, studentActive ? 255 : 0);
+}
+
+/**
+ * Pretend to be the student's own program sharing this serial port.
+ *
+ * The bridge currently owns the whole device, so nothing competes with it and
+ * the contention problem cannot be observed. This stands in for the program a
+ * real user would be running, and does the two things such a program does:
+ *
+ *   - reads from the serial port, as MakeCode's serial.onDataReceived and
+ *     MicroPython's REPL both do.
+ *
+ *   - writes to the serial port, which lands in the middle of reply frames.
+ *
+ * The first of those turned out to behave differently from what was expected,
+ * and the difference is the point of this apparatus.
+ *
+ * Serial::read() takes an EXCLUSIVE lock (codal-core Serial.cpp:503, "if
+ * (rxInUse()) return DEVICE_SERIAL_IN_USE"). Two readers do not share the ring
+ * and lose bytes to each other; the second one is refused outright and reads
+ * nothing at all. The bridge's main loop sits inside read(SYNC_SLEEP) holding
+ * that lock, so a user program's reader is locked out for as long as the bridge
+ * is waiting for a request, which is almost always.
+ *
+ * The lock is released while the bridge is busy replying, so bytes that arrive
+ * during a long reply are the ones this can actually take. Both outcomes are
+ * counted and reported, because the ratio is the interesting measurement:
+ * lockouts mean the user's program never sees its own input, stolen bytes mean
+ * the bridge loses requests.
+ *
+ * This is apparatus for demonstrating the problem, not part of the protocol.
+ * It is the evidence the production version needs a receive filter in
+ * codal-core: not as an optimisation over polling, but because polling cannot
+ * work at all.
+ */
+static void
+student_fiber()
+{
+    int len = 0;
+    int chatter = 0;
+
+    while(1)
+    {
+        if (!studentActive)
+        {
+            uBit.sleep(100);
+            continue;
+        }
+
+        int c = uBit.serial.read(ASYNC);
+
+        if (c == DEVICE_SERIAL_IN_USE)
+        {
+            lockouts++;
+        }
+        else if (c >= 0)
+        {
+            stolenBytes++;
+
+            if (c == '\r' || c == '\n')
+            {
+                if (len > 0)
+                {
+                    stolenBuffer[len] = 0;
+                    uBit.serial.send( ManagedString("[student ate: ")
+                                      + ManagedString((const char *)stolenBuffer) + "]\r\n" );
+                    len = 0;
+                }
+            }
+            else if (len < BRIDGE_STUDENT_BUFFER - 1)
+            {
+                stolenBuffer[len++] = (char)c;
+            }
+        }
+
+        // Ordinary program output. This is what collides with reply frames.
+        if (++chatter >= BRIDGE_STUDENT_CHATTER)
+        {
+            chatter = 0;
+            uBit.serial.send( ManagedString("[student] eaten ") + ManagedString((int)stolenBytes)
+                              + ", locked out " + ManagedString((int)lockouts) + "\r\n" );
+        }
+
+        uBit.sleep(BRIDGE_STUDENT_POLL);
+    }
+}
+
+/**
+ * Blink the centre pixel once per request, off the request path.
+ *
+ * Done inline originally, with the main loop holding the pixel lit for 50ms
+ * after each request. That capped the protocol at 20 requests a second — about
+ * 1.3 KB/s at 64 bytes a chunk, whatever the baud rate — making the device, not
+ * the link, the bottleneck in every measurement. Here the sleep costs nothing.
+ * Requests arriving faster than this fiber can blink are simply not shown.
+ */
+static void
+indicator_fiber()
+{
+    while(1)
+    {
+        if (requestSeen)
+        {
+            requestSeen = false;
+
+            uBit.display.image.setPixelValue(2, 2, 255);
+            uBit.sleep(50);
+            uBit.display.image.setPixelValue(2, 2, 0);
+        }
+
+        uBit.sleep(10);
     }
 }
 
@@ -310,9 +469,11 @@ handle_read(const char *request, int len)
 
     uint32_t total = uBit.log.getDataLength( DataFormat::CSV );
 
-    if (index >= total)
+    // Distinguished from a malformed request, so a client can tell "you sent me
+    // rubbish" from "there is nothing here yet".
+    if (total == 0 || index >= total)
     {
-        send_error(DEVICE_INVALID_PARAMETER);
+        send_error(DEVICE_NO_DATA);
         return;
     }
 
@@ -434,6 +595,189 @@ handle_mirror(const char *request, int len)
     uBit.log.setSerialMirroring(mirroring);
 
     send_frame( ManagedString("m ") + ManagedString((int)mirroring) );
+}
+
+/**
+ * Time one pattern of reads at one chunk size.
+ *
+ * Measures only MicroBitLog::readData, which is an I2C round trip to the
+ * interface chip's flash. No host and no serial are involved, so this is the
+ * rate at which the device can get log data into its own RAM — the ceiling
+ * every transport sits under, this bridge and the mailbox design alike.
+ *
+ * @param size    bytes per read
+ * @param stride  how far the offset advances between reads. Equal to size for
+ *                a sequential walk; BRIDGE_BENCH_STRIDE to scatter across the
+ *                log and defeat the cache.
+ * @param pattern reported as-is: 0 sequential, 1 scattered.
+ */
+static void
+bench_one(uint32_t size, uint32_t stride, int pattern, uint32_t reads, uint32_t total)
+{
+    uint32_t span = total - size;       // highest offset a full read still fits at
+    uint32_t offset = 0;
+    uint32_t done = 0;
+
+    CODAL_TIMESTAMP start = system_timer_current_time_us();
+
+    for (uint32_t i = 0; i < reads; i++)
+    {
+        if ( uBit.log.readData( benchBuffer, offset, size, DataFormat::CSV, total ) != DEVICE_OK )
+            break;
+
+        done++;
+        offset = (offset + stride) % (span + 1);
+    }
+
+    CODAL_TIMESTAMP micros = system_timer_current_time_us() - start;
+
+    if (done == 0)
+    {
+        send_error(DEVICE_NO_DATA);
+        return;
+    }
+
+    // Guard the divisions rather than the clock: a fast enough run can measure
+    // as zero microseconds.
+    if (micros == 0)
+        micros = 1;
+
+    uint32_t bytes = done * size;
+
+    send_frame( ManagedString("t ") + ManagedString((int)size)
+                + " " + ManagedString(pattern)
+                + " " + ManagedString((int)done)
+                + " " + ManagedString((int)micros)
+                + " " + ManagedString((int)(micros / done))
+                + " " + ManagedString((int)(((uint64_t)bytes * 1000000) / micros)) );
+}
+
+/**
+ * Handle 'T [reads]': measure how fast the log can be read out of flash.
+ *
+ * Reports each measurement as
+ *
+ *     t <size> <pattern> <reads> <microseconds> <us per read> <bytes per second>
+ *
+ * at 16, 64, 128 and 256 bytes, sequential and scattered. Comparing sizes
+ * separates the fixed cost of a read from the per-byte cost: if 256 bytes costs
+ * little more than 16, the fixed cost dominates and chunks should be bigger.
+ * Comparing patterns shows what the cache is worth.
+ *
+ * Stop logging first. Rows being written during a run are I2C traffic competing
+ * with the reads, and the result will be worse and noisier. The reply says
+ * whether logging was running so a result taken by accident is still readable.
+ */
+static void
+handle_benchmark(const char *request, int len)
+{
+    int pos = 1;
+    uint32_t reads;
+
+    if ( parse_number(request, len, &pos, &reads) != DEVICE_OK || reads == 0 )
+        reads = BRIDGE_BENCH_READS;
+
+    uint32_t total = uBit.log.getDataLength( DataFormat::CSV );
+
+    // Conditions first: the numbers are not interpretable without them, and
+    // the minimum is reported so a refusal explains itself.
+    send_frame( ManagedString("b ") + ManagedString((int)total)
+                + " " + ManagedString((int)logging)
+                + " " + ManagedString((int)reads)
+                + " " + ManagedString(BRIDGE_BENCH_MINIMUM) );
+
+    if (total < BRIDGE_BENCH_MINIMUM)
+    {
+        send_error(DEVICE_NO_DATA);
+        return;
+    }
+
+    readInProgress = true;
+
+    static const uint32_t sizes[] = { 16, 64, 128, BRIDGE_BENCH_BUFFER };
+
+    for (uint32_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++)
+    {
+        if (sizes[i] >= total)
+            continue;
+
+        bench_one( sizes[i], sizes[i], 0, reads, total );
+        bench_one( sizes[i], BRIDGE_BENCH_STRIDE, 1, reads, total );
+    }
+
+    readInProgress = false;
+
+    send_frame("e");
+}
+
+/**
+ * Handle 'F <rows>': write rows as fast as the log will accept them.
+ *
+ * Test apparatus. The background logger writes one row a second, so filling
+ * enough of the log to benchmark a read against would take a quarter of an hour
+ * of watching a terminal. This fills it in seconds.
+ *
+ * The values are a counter, not real sensor readings — the data is meaningless
+ * and is only there to be read back. The column names match the ones the
+ * background logger uses, so filling does not introduce a second header row.
+ *
+ * The reply doubles as a write benchmark:
+ *
+ *     f <rows written> <bytes added> <microseconds> <bytes per second>
+ *
+ * Stop logging first, or the background fiber competes for the log mutex and
+ * the write figure means nothing.
+ */
+static void
+handle_fill(const char *request, int len)
+{
+    int pos = 1;
+    uint32_t rows;
+
+    if ( parse_number(request, len, &pos, &rows) != DEVICE_OK || rows == 0 )
+    {
+        send_error(DEVICE_INVALID_PARAMETER);
+        return;
+    }
+
+    if (rows > BRIDGE_FILL_MAX)
+        rows = BRIDGE_FILL_MAX;
+
+    uint32_t before = uBit.log.getDataLength( DataFormat::CSV );
+    uint32_t done = 0;
+
+    // Borrowing the read flag: its real job is to stop notify_fiber putting an
+    // 'N' frame in the middle of something, which applies here too.
+    readInProgress = true;
+
+    CODAL_TIMESTAMP start = system_timer_current_time_us();
+
+    for (uint32_t i = 0; i < rows; i++)
+    {
+        if ( uBit.log.isFull() )
+            break;
+
+        uBit.log.beginRow();
+        uBit.log.logData( "temperature", ManagedString((int)i) );
+        uBit.log.logData( "light", ManagedString((int)(i & 0xFF)) );
+        uBit.log.endRow();
+
+        done++;
+    }
+
+    CODAL_TIMESTAMP micros = system_timer_current_time_us() - start;
+
+    readInProgress = false;
+
+    if (micros == 0)
+        micros = 1;
+
+    uint32_t added = uBit.log.getDataLength( DataFormat::CSV ) - before;
+
+    send_frame( ManagedString("f ") + ManagedString((int)done)
+                + " " + ManagedString((int)added)
+                + " " + ManagedString((int)micros)
+                + " " + ManagedString((int)(((uint64_t)added * 1000000) / micros)) );
 }
 
 /**
@@ -564,6 +908,9 @@ handle_hello(const char *request, int len)
     if (logging)
         flags |= BRIDGE_FLAG_LOGGING;
 
+    if (studentActive)
+        flags |= BRIDGE_FLAG_STUDENT;
+
     // '?' primes by default, because the first hello of a session is the one
     // that has to get through. '? 0' skips the filler, for every hello after
     // that, once the buffer is already warm.
@@ -577,7 +924,12 @@ handle_hello(const char *request, int len)
     if ( parse_number(request, len, &pos, &pad) != DEVICE_OK || pad != 0 )
         send_padding();
 
-    send_frame( ManagedString("! ") + ManagedString(BRIDGE_VERSION) + " " + ManagedString(flags) );
+    // The third number is MICROBIT_LOG_MODE, the CODAL build option picking the
+    // HTML header at the front of the log. Same as the demo build — see
+    // handle_hello there, and docs/datalog-datatool-header.md.
+    send_frame( ManagedString("! ") + ManagedString(BRIDGE_VERSION)
+                + " " + ManagedString(flags)
+                + " " + ManagedString(MICROBIT_LOG_MODE) );
 }
 
 static void
@@ -627,6 +979,14 @@ handle_request(const char *request, int len)
             send_diagnostics();
             break;
 
+        case 'T':
+            handle_benchmark(request, len);
+            break;
+
+        case 'F':
+            handle_fill(request, len);
+            break;
+
         default:
             send_error(DEVICE_INVALID_PARAMETER);
             break;
@@ -646,11 +1006,15 @@ serial_bridge_test()
     // handing click detection to the multibutton, so pressing both no longer
     // fires a start and a stop on the way to the clear. See MicroBit.cpp:328.
     uBit.messageBus.listen( DEVICE_ID_BUTTON_AB, DEVICE_BUTTON_EVT_CLICK, onButtonAB );
+    uBit.messageBus.listen( MICROBIT_ID_LOGO, MICROBIT_BUTTON_EVT_CLICK, onLogo );
 
     create_fiber( log_row_fiber );
     create_fiber( notify_fiber );
+    create_fiber( indicator_fiber );
+    create_fiber( student_fiber );
 
-    send_frame( ManagedString("! ") + ManagedString(BRIDGE_VERSION) + " 0" );
+    send_frame( ManagedString("! ") + ManagedString(BRIDGE_VERSION) + " 0 "
+                + ManagedString(MICROBIT_LOG_MODE) );
 
     // Report the log's state as found, before anything in this program has had
     // a chance to change it.
@@ -679,15 +1043,12 @@ serial_bridge_test()
         // End of a request line.
         if (len > 0)
         {
-            uBit.display.image.setPixelValue(2, 2, 255);
+            requestSeen = true;
 
             if (overflow)
                 send_error(DEVICE_INVALID_PARAMETER);
             else
                 handle_request(requestBuffer, len);
-
-            uBit.sleep(50);
-            uBit.display.image.setPixelValue(2, 2, 0);
         }
 
         len = 0;

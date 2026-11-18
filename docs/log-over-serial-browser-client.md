@@ -48,8 +48,26 @@ the user flow around "connect, flash, read".
 
 ## What already works
 
-The device half is done. `source/samples/SerialBridgeTest.cpp` in this repo has been
-driven by hand over `screen` at 115200 baud for every message below.
+The device half is done, and there are **two builds**. `source/main.cpp` picks which one
+is compiled.
+
+| | | |
+|---|---|---|
+| **`DataLogDemo.cpp`** | `data_log_demo()` | **Build against this one.** |
+| `SerialBridgeTest.cpp` | `serial_bridge_test()` | Development build |
+
+**The demo build is the target.** Its logging half is a faithful translation of the
+MakeCode program a user would really write, and it carries only the messages a real client
+needs. If your client works against it, it works.
+
+The development build is the same protocol plus apparatus for investigating the device:
+`D` diagnostics, `T` benchmark, `F` log fill, `M` mirroring, and a simulated second
+program that fights for the serial port. Useful for understanding failures, and for
+hardening your client against contention — but nothing in it should be required.
+
+Everything below applies to both unless marked **(dev build only)**.
+
+Both have been driven by hand over `screen` at 115200 baud for every message.
 
 Build and flash it with:
 
@@ -86,11 +104,35 @@ Two consequences:
 
 ### Build configuration
 
-`codal.json` in this repo sets `CONFIG_MICROBIT_ERASE_USER_DATA_ON_REFLASH: 0`, which is
-**not** the CODAL default. Stock CODAL invalidates the data log on every reflash. We turned
-it off while chasing a log corruption bug (see `docs/datalog-findings.md`) and kept it
-because it makes the log survive a reset, which is convenient while prototyping. If you
-build your own firmware and the log starts vanishing, that setting is why.
+`codal.json` sets two options that are **not** CODAL defaults:
+
+```json
+"CONFIG_MICROBIT_LOG_FULL_ERASE_BY_DEFAULT": 1,
+"MICROBIT_LOG_MODE": 3
+```
+
+`MICROBIT_LOG_MODE` picks the HTML header CODAL writes at the front of the log, and `3` is
+the `datatool` mode — a local addition to CODAL, not upstream. It changes nothing the
+serial protocol can see; see [`datalog-datatool-header.md`](datalog-datatool-header.md),
+which also explains what it would take to reach it over the wire.
+
+Without it, reflashing only marks the log empty: `_invalidate()` zeroes the metadata
+(`MicroBitLog.cpp:913`) and the following `_clear(false)` erases flash only as far as
+`dataStart` (`:280`). Everything past the first data page survives, so the previous
+session's rows are still physically there and `MY_DATA.HTM` still renders them — which is
+not what a MakeCode program does.
+
+With it on, `_invalidate()` calls `_clear()`, whose default argument is that same macro,
+so the whole region is erased. It also makes `uBit.log.clear()` a full erase, matching
+`datalogger.deleteLog()`. The cost is a pause of a few seconds on the first boot after a
+flash while ~118 pages are erased one at a time.
+
+> **Any change to `codal.json` needs `rm -rf build` before it takes effect.** The config
+> reaches the compiler through a force-included header that CMake does not track as a
+> dependency, so nothing recompiles, the link is skipped, and `MICROBIT.hex` is left
+> untouched — while the build prints "Built target MICROBIT_hex" and looks fine. Always
+> check `ls -la MICROBIT.hex codal.json` and confirm the hex is the newer one before
+> flashing. This cost us most of a day, three separate times.
 
 ### The contract to code against
 
@@ -115,16 +157,18 @@ but not required, so requests can be typed by hand in a terminal.
 
 | Request | Device sends |
 |---|---|
-| (boot / reset) | `<RS>! 1 0`, then the `D` diagnostics pair — no filler, so a WebUSB client will probably miss all of it |
-| `?` | 2KB of filler, **then** `<RS>! <version> <flags>` — see below |
-| `? 0` | `<RS>! <version> <flags>` alone, no filler |
+| (boot / reset) | `<RS>! 1 0 <mode>`, then the `D` diagnostics pair — no filler, so a WebUSB client will probably miss all of it |
+| `?` | 2KB of filler, **then** `<RS>! <version> <flags> <mode>` — see below |
+| `? 0` | `<RS>! <version> <flags> <mode>` alone, no filler |
 | `L` | `<RS>l 2 <n>` — `n` is the CSV log length in bytes |
 | `R <index> <count>` | `<RS>d <index> <n> <crc>` + exactly `n` raw bytes + `<RS>e` |
 | `H` | `<RS>h <hdr> <n> <crc>` + exactly `n` raw bytes + `<RS>e` — the column header row |
 | `S <0\|1>` | `<RS>s <0\|1>`, and on subscribe one immediate `<RS>N …` baseline |
-| `M <0\|1>` | `<RS>m <0\|1>` — toggles log mirroring, see below |
-| `D` | `<RS>i <present> <full> <n>` then `<RS>x <hex>` — diagnostics, see below |
 | unknown / unparseable / too long | `<RS>E <code>` — CODAL error codes, e.g. `-1001` |
+| `M <0\|1>` | **(dev build only)** `<RS>m <0\|1>` — toggles log mirroring, see below |
+| `D` | **(dev build only)** `<RS>i <present> <full> <n>` then `<RS>x <hex>` — diagnostics |
+| `T [reads]` | **(dev build only)** `<RS>b …` then `<RS>t …` per measurement then `<RS>e` |
+| `F <rows>` | **(dev build only)** `<RS>f <rows> <bytes> <us> <bytes/sec>` — fill the log fast |
 
 Unprompted, while subscribed:
 
@@ -133,7 +177,71 @@ Unprompted, while subscribed:
 | the end of the log moved | `<RS>N <end> <hdr>` — at most once every 250ms |
 
 Hello flags are a bitfield: `1` log present, `2` log full, `4` mirroring on,
-`8` subscribed, `16` logging is running.
+`8` subscribed, `16` logging is running, `32` the simulated student program is
+running (see below).
+
+`<mode>` is `MICROBIT_LOG_MODE`, the CODAL build option that picks the HTML header written
+at the front of the log: `0` the data.microbit.org experience, `1` the basic offline one,
+`2` next gen, `3` datatool. **It says which display experience this hex was built for.**
+These builds report `3`.
+
+It is in the hello because the header itself is **unreachable over this protocol** — `R`
+reads `DataFormat::CSV`, which starts below the header, so a client that never opens
+`MY_DATA.HTM` has no other way to know. See
+[`datalog-datatool-header.md`](datalog-datatool-header.md).
+
+Treat it as a property of the **build**, not of the state: it is compiled in and cannot
+change while the program runs. Read it once at connect. A mode the client does not
+recognise should fall back to the ordinary display rather than being refused — the list
+will grow.
+
+### Reproducing the contention this design has to survive (dev build only)
+
+**Touch the logo** to toggle a simulated student program on and off. The top right LED
+lights while it runs. It is deliberately not a serial command — once it is eating bytes,
+a command to stop it is exactly the sort of thing that gets eaten.
+
+It does the two things a real user's program does on this shared port:
+
+- **Reads from it**, as MakeCode's `serial.onDataReceived` and MicroPython's REPL both do.
+- **Writes to it**, twice a second, which lands in the middle of reply frames.
+
+**The read side does not work the way we first assumed, and the difference matters.**
+`Serial::read()` takes an *exclusive* lock — `codal-core/source/driver-models/Serial.cpp:503`:
+
+```cpp
+int Serial::read(SerialMode mode)
+{
+    if(rxInUse())
+        return DEVICE_SERIAL_IN_USE;    // -1011
+    lockRx();
+    ...
+```
+
+So two readers do not share the 20-byte ring and lose bytes to each other. **The second
+one is refused outright and reads nothing at all.** The bridge sits inside
+`read(SYNC_SLEEP)` holding that lock whenever it is waiting for a request, which is
+almost always, so a user program's reader is simply locked out.
+
+The lock is released while the bridge is busy replying, so bytes arriving during a long
+reply are the ones that can actually be taken. The simulation counts both outcomes:
+
+```
+[student] eaten 3, locked out 48217
+```
+
+Lockouts mean the user's program never sees its own serial input. Eaten bytes mean the
+bridge loses a request. Both are fatal to co-existence, in opposite directions.
+
+This is why the production version needs a receive filter in `codal-core` — **not as an
+optimisation over polling the ring, but because polling cannot work at all.**
+
+**Test your client against it before calling it done** — a client that only works with
+the logo off is not finished.
+
+A second, milder source of collisions is `M 1`, which puts logged rows on the wire as
+plain text. Use that to check frame separation; use the logo to check you survive losing
+requests entirely.
 
 ### Why `?` sends 2KB of rubbish
 
@@ -174,7 +282,7 @@ Two things to know:
   says so itself. A client that reflashes to make the link work destroys the data it
   came for.
 
-### `D` — diagnostics
+### `D` — diagnostics (dev build only)
 
 `D` reports what the **device** believes about the log: `<RS>i <present> <full> <n>`
 followed by `<RS>x <hex>`, the first 64 bytes of CSV as ASCII hex (just `<RS>x` when
@@ -190,15 +298,97 @@ points in time. `D` reads DAPLink's flash live over I2C, so it cannot be.
 
 Use it rather than the file whenever you need to know the real state.
 
-### Starting and stopping logging
+### `T` — how fast can the log be read at all (dev build only)
 
-In the test firmware, logging is off at reset and is driven by the buttons on the
-device: A starts, B stops, A and B together clear the log and leave it stopped.
-The top-left LED is lit while logging is running.
-There is no command to start, stop or clear over the wire, so flag `16` is read-only
-— treat it as information to show the user ("this micro:bit is not recording"), not
-as something the client can change. A real product would log under the student's own
-program's control, so do not build the client around the buttons.
+`T` times `MicroBitLog::readData` on the device, with no host and no serial involved.
+That call is an I2C round trip to the interface chip's flash, and **every transport pays
+it** — this bridge, the mailbox design in #271, Bluetooth, all of them. It is the ceiling
+nothing can beat, so it is worth knowing before arguing about links.
+
+```
+T          # 64 reads per measurement
+T 200      # more, for a steadier number
+```
+
+Replies, one `b` line of conditions then a `t` line per measurement, ending with `e`:
+
+```
+b <log bytes> <logging?> <reads> <minimum needed>
+t <size> <pattern> <reads> <microseconds> <us per read> <bytes per second>
+```
+
+If the log is below the minimum you get `b …` then `E -1012` and nothing else. Fill it
+first with `F` rather than waiting on the one-row-a-second background logger:
+
+```
+F 1000     # about 22KB, a few seconds
+T          # now there is something to measure
+```
+
+`F` writes counter values, not real readings — the data is meaningless and only there to
+be read back. It uses the same column names as the background logger, so it does not add
+a second header row. Its reply is also a **write** benchmark, which is worth recording
+alongside the read figures.
+
+`pattern` is `0` sequential, `1` scattered. Sizes are 16, 64, 128 and 256 bytes.
+
+**How to read it:**
+
+- **Compare sizes.** Each read has a fixed cost (the I2C handshake) and a per-byte cost.
+  If 256 bytes costs barely more than 16, the fixed cost dominates and chunks should be
+  bigger — `BRIDGE_MAX_CHUNK` is currently 64, and the mailbox draft uses 128. If 256
+  costs about sixteen times 16, it is raw bus speed and chunk size barely matters.
+- **Compare patterns.** Sequential reads benefit from the 256-byte cache in front of the
+  flash; scattered ones defeat it. The gap is what the cache is worth.
+- **Compare the best number against end-to-end throughput.** Close together means I2C is
+  the bottleneck and the transport choice does not affect speed. Far apart means the link
+  is the bottleneck and it does.
+
+**Stop logging first** — press B. Rows being written during a run are I2C traffic
+competing with the reads. The `b` line reports whether logging was running, so a run taken
+by accident is still readable.
+
+Needs at least 2KB in the log, and the scattered numbers only mean much with several KB —
+log for a few minutes first, or they all land inside the cache.
+
+### What the demo build is logging
+
+A faithful C++ translation of the MakeCode program a user would really write:
+**accelerometer x, y and z every 100ms**, into columns named up front, with the
+`Time (seconds)` column MakeCode's datalogger includes by default. So the CSV is:
+
+```
+Time (seconds),x,y,z
+1.20,-16,32,-1008
+1.30,-24,28,-1012
+```
+
+**The log is cleared when you reflash**, as it is with a MakeCode program. That is CODAL's
+own behaviour (`CONFIG_MICROBIT_ERASE_USER_DATA_ON_REFLASH`, default 1) — see the build
+configuration note above if a flash ever leaves an old log in place.
+
+Driven entirely by the device's buttons, with an icon showing the state:
+
+| | | |
+|---|---|---|
+| **A** | start logging | tick |
+| **B** | stop logging | cross |
+| **A+B** | stop, clear the log, reset the columns | skull |
+| *log fills* | stops itself | all LEDs on |
+
+At roughly 20 bytes a row, ten rows a second, the log fills in about **ten minutes** —
+short enough to test the full case deliberately.
+
+**The display belongs to the logging program.** The demo build shows nothing of its own on
+it, because a production bridge could not take the display from the user's program either.
+Read the state from the hello flags instead. (The dev build does use LEDs — a pixel per
+request, a pixel while logging — which is one of several reasons it isn't the target.)
+
+There is no command to start, stop or clear over the wire. The logging flag is read-only —
+information to show the user ("this micro:bit is not recording"), not something the client
+can change.
+The buttons are the user's, not yours — this is deliberately shaped like the program a
+real user would be running, so do not build the client around being able to drive them.
 
 **A clear is the case most likely to break your client.** Nothing announces it. The
 end of the data simply drops to zero and the next `N` notice reports the new, smaller
@@ -286,15 +476,16 @@ Lancaster. Until it lands, a client reading a whole log from offset 0 sees every
 row as it goes and can track column changes itself; a client that only follows from the
 live end cannot.
 
-### Testing the framing
+### Testing the framing (dev build only)
 
 Send `M 1` to turn on log mirroring. Each logged row is then also written to the serial
 port as plain text, **outside any frame**. That is what a user's own program output looks
 like on this shared wire, and it is the only way to confirm a client correctly separates
 frames from console text. Send `M 0` to stop.
 
-The device also logs a temperature/light row once a second in the background, so the
-number returned by `L` grows while you watch.
+With logging running (press A), the device writes an accelerometer row ten times a
+second, so the number returned by `L` grows visibly while you watch — and moving the
+board changes the values, which makes it obvious whether a live view is really live.
 
 ### What the device does not do
 
@@ -414,19 +605,16 @@ Explicitly **not** part of this task:
 - **Request lines are capped at 32 bytes** by the device
   (`BRIDGE_MAX_REQUEST`). Longer lines get `E -1001`.
 
-- **`E -1001` is ambiguous on `R`.** `handle_read` returns `DEVICE_INVALID_PARAMETER` both
-  for a malformed request *and* for a read against an empty log, because it rejects any
-  read where `index >= total` and `total` is 0. So `R 0 64` on an empty log fails with the
-  same code as `R` with no arguments. This is inconsistent with `H`, which returns `-1012`
-  (`DEVICE_NO_DATA`) for an empty log. Call `L` or `D` first and do not read when the
-  length is 0. Worth fixing in the firmware; not fixed yet.
+- **`R` distinguishes its two failures.** `E -1001` (`DEVICE_INVALID_PARAMETER`) means the
+  request was malformed. `E -1012` (`DEVICE_NO_DATA`) means there is nothing to read —
+  either the log is empty or the offset is past the end. `H` uses the same convention.
+  Call `L` first and do not read when the length is 0.
 
-- **Throughput is capped by a debug blink, not by the link.** The device holds the centre
-  LED lit for 50ms after every completed request, inside the request loop. At 64 bytes a
-  chunk that is about **1.3 KB/s whatever the baud rate** — roughly 90 seconds for a full
-  120KB log. It is leftover scaffolding from the first step and should be cut or moved to
-  its own fiber before anyone measures real throughput. Do not read anything into timings
-  taken before that happens.
+- **The centre LED no longer throttles requests.** It used to be held lit for 50ms inside
+  the request loop, capping the protocol at 20 requests a second — about 1.3 KB/s at 64
+  bytes a chunk, whatever the baud rate. It now blinks from its own fiber and the request
+  path does not wait for it. Any throughput figure measured before this change is
+  meaningless; re-measure. Requests arriving faster than the blink are simply not shown.
 
 - **DAPLink drops bytes when overwhelmed**, and writes the literal text
   `<DAPLink:Overflow>` into the stream when it does. Unlikely at this tiny scale, but if
